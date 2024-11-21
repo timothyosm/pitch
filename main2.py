@@ -3,6 +3,7 @@ import mediapipe as mp
 import pygame
 import numpy as np
 from scipy.ndimage import distance_transform_edt
+import matplotlib.cm as cm
 
 # Initialize pygame and set up display window.
 pygame.init()
@@ -22,111 +23,67 @@ pose = mp_pose.Pose(
 
 # Initialize webcam.
 cap = cv2.VideoCapture(0)
-# Optionally set camera resolution (commented out to decouple from window size).
-# cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-# cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# Set camera resolution to reduce computational load.
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
 
 # Initialize previous mask for temporal smoothing.
 previous_mask = None
 
-
-def create_thermal_colormap():
-    """Creates a thermal colormap from cool to hot colors."""
-    colors = [
-        (0, 0, 0),        # Black for background.
-        (200, 0, 0),      # Deep red (coolest body part).
-        (255, 60, 0),     # Red-orange.
-        (255, 150, 0),    # Orange.
-        (255, 255, 0),    # Yellow.
-        (255, 255, 255)   # White (hottest).
-    ]
-
-    colormap = np.zeros((256, 3), dtype=np.uint8)
-    intervals = len(colors) - 1
-    interval_size = 256 // intervals
-
-    for i in range(intervals):
-        start_color = np.array(colors[i])
-        end_color = np.array(colors[i + 1])
-        for j in range(interval_size):
-            t = j / interval_size
-            color = start_color * (1 - t) + end_color * t
-            idx = i * interval_size + j
-            if idx < 256:
-                colormap[idx] = color
-
-    return colormap
-
-
-THERMAL_COLORMAP = create_thermal_colormap()
-
-
-def smooth_mask(current_mask, prev_mask, temporal_factor=0.8):
+def smooth_mask(current_mask, prev_mask, temporal_factor=0.2):
     """Applies temporal and spatial smoothing to the mask."""
-    # Apply strong spatial smoothing first.
-    kernel_size = 15  # Increased kernel size for stronger smoothing.
+    # Apply spatial smoothing.
+    kernel_size = 15
     current_mask = cv2.GaussianBlur(current_mask, (kernel_size, kernel_size), 0)
 
-    # Threshold the mask to make it more definitive.
-    current_mask = cv2.threshold(current_mask, 0.3, 1, cv2.THRESH_BINARY)[1]
+    # Lower the threshold to include more of the arms.
+    _, current_mask = cv2.threshold(current_mask, 0.1, 1, cv2.THRESH_BINARY)
 
-    # Apply morphological operations to fill holes and smooth edges.
+    # Morphological operations.
     kernel = np.ones((5, 5), np.uint8)
     current_mask = cv2.morphologyEx(current_mask, cv2.MORPH_CLOSE, kernel)
     current_mask = cv2.morphologyEx(current_mask, cv2.MORPH_OPEN, kernel)
 
-    # Apply temporal smoothing if we have a previous mask.
+    # Apply dilation to widen the arms.
+    dilation_kernel = np.ones((15, 15), np.uint8)
+    current_mask = cv2.dilate(current_mask, dilation_kernel, iterations=1)
+
+    # Temporal smoothing.
     if prev_mask is not None:
-        return cv2.addWeighted(
+        current_mask = cv2.addWeighted(
             current_mask, 1 - temporal_factor, prev_mask, temporal_factor, 0)
     return current_mask
 
-
 def create_core_heat_mask(segmentation_mask):
     """Creates a heat mask that's hotter in the core and cooler at the edges."""
-    # Create binary mask with stronger threshold.
-    binary_mask = (segmentation_mask > 0.4).astype(np.uint8)
-
-    # Calculate distance from edge for every point inside the mask.
+    binary_mask = (segmentation_mask > 0.1).astype(np.uint8)
     distance_map = distance_transform_edt(binary_mask)
 
-    # Normalize the distance map.
     if distance_map.max() > 0:
         distance_map = distance_map / distance_map.max()
 
-    # Apply gamma correction to create more pronounced core.
-    gamma = 1.5
+    # Reduce gamma to make edges more pronounced.
+    gamma = 1.0
     heat_mask = np.power(distance_map, gamma)
-
-    # Scale back to original segmentation mask range and smooth.
     heat_mask = heat_mask * segmentation_mask
     heat_mask = cv2.GaussianBlur(heat_mask, (11, 11), 0)
 
     return heat_mask
 
-
 def apply_thermal_effect(frame, segmentation_mask):
     """Applies thermal camera effect to the frame with core-to-edge gradient."""
-    # Create heat mask with core-to-edge gradient.
     heat_mask = create_core_heat_mask(segmentation_mask)
-
-    # Add very subtle noise for texture (reduced noise amount).
     noise = np.random.normal(0, 0.02, heat_mask.shape).astype(np.float32)
     heat_mask = np.clip(heat_mask + noise * segmentation_mask, 0, 1)
-
-    # Apply stronger blur for smoother transition.
     heat_mask = cv2.GaussianBlur(heat_mask, (11, 11), 0)
+    heat_mask = np.clip(heat_mask, 0, 1)
 
-    # Convert to color range.
-    normalized_mask = (heat_mask * 255).astype(np.uint8)
-
-    # Create the thermal image.
-    thermal_image = np.zeros_like(frame)
-    for i in range(3):
-        thermal_image[:, :, i] = THERMAL_COLORMAP[normalized_mask][:, :, i]
+    # Apply the 'inferno' colormap.
+    thermal_image = cm.get_cmap('inferno')(heat_mask)[:, :, :3]
+    thermal_image = (thermal_image * 255).astype(np.uint8)
 
     # Create background.
-    background = np.zeros_like(frame)  # Pure black background.
+    background = np.zeros_like(frame)
 
     # Blend thermal image with background.
     mask_3d = np.stack([segmentation_mask] * 3, axis=-1)
@@ -134,42 +91,31 @@ def apply_thermal_effect(frame, segmentation_mask):
 
     return result.astype(np.uint8)
 
-
 def draw_thermal_view(frame):
     """Creates a visualization with thermal camera effect."""
     global previous_mask
 
-    # Flip the frame horizontally to create mirror effect.
+    # Flip the frame horizontally.
     frame = cv2.flip(frame, 1)
-
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = pose.process(frame_rgb)
 
-    # Get frame dimensions.
-    frame_height, frame_width = frame.shape[:2]
-
-    # Create surface for drawing.
-    final_surface = pygame.Surface((frame_width, frame_height))
-    final_surface.fill((0, 0, 0))  # Black background.
-
     if results.segmentation_mask is not None:
-        # Process segmentation mask.
-        current_mask = results.segmentation_mask
+        current_mask = results.segmentation_mask.astype(np.float32)
 
-        # Apply temporal and spatial smoothing.
+        # Apply smoothing.
         smoothed_mask = smooth_mask(current_mask, previous_mask)
         previous_mask = smoothed_mask.copy()
 
         # Apply thermal effect.
         thermal_frame = apply_thermal_effect(frame_rgb, smoothed_mask)
 
-        # Convert to pygame surface and rotate to correct orientation.
-        thermal_frame = np.rot90(thermal_frame, k=-1)
-        thermal_surface = pygame.surfarray.make_surface(thermal_frame)
-        final_surface.blit(thermal_surface, (0, 0))
-
-    return np.rot90(pygame.surfarray.array3d(final_surface))
-
+        # Convert to pygame surface.
+        thermal_surface = pygame.surfarray.make_surface(thermal_frame.swapaxes(0, 1))
+        return thermal_surface
+    else:
+        # Return a blank surface if no segmentation mask is available.
+        return pygame.Surface((frame.shape[1], frame.shape[0]))
 
 def main():
     """Main loop for thermal camera effect display."""
@@ -194,10 +140,10 @@ def main():
             break
 
         try:
-            output_array = draw_thermal_view(frame)
-            surface = pygame.surfarray.make_surface(output_array.transpose(1, 0, 2))
-            surface = pygame.transform.scale(surface, (SCREEN_WIDTH, SCREEN_HEIGHT))
-            screen.blit(surface, (0, 0))
+            thermal_surface = draw_thermal_view(frame)
+            thermal_surface = pygame.transform.scale(
+                thermal_surface, (SCREEN_WIDTH, SCREEN_HEIGHT))
+            screen.blit(thermal_surface, (0, 0))
             pygame.display.flip()
         except Exception as e:
             print(f"Error processing frame: {e}")
@@ -208,7 +154,6 @@ def main():
     cap.release()
     pygame.quit()
     pose.close()
-
 
 if __name__ == '__main__':
     main()
